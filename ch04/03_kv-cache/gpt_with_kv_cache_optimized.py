@@ -3,6 +3,7 @@
 # This file can be run as a standalone script.
 
 import time
+import math
 import tiktoken
 import torch
 import torch.nn as nn
@@ -19,6 +20,8 @@ class MultiHeadAttention(nn.Module):
         self.d_out = d_out
         self.num_heads = num_heads
         self.head_dim = d_out // num_heads  # Reduce the projection dim to match desired output dim
+        # 预计算缩放常量，避免每次前向开方与除法
+        self.scale = 1.0 / math.sqrt(self.head_dim)
 
         self.W_query = nn.Linear(d_in, d_out, bias=qkv_bias)
         self.W_key = nn.Linear(d_in, d_out, bias=qkv_bias)
@@ -28,10 +31,17 @@ class MultiHeadAttention(nn.Module):
 
         ####################################################
         # NEW
+        # 设置最大序列长度，如果未提供则使用上下文长度
         self.max_seq_len = max_seq_len or context_length
+        # 设置窗口大小，如果未提供则使用最大序列长度
         self.window_size = window_size or self.max_seq_len
+        # 注册一个非持久性缓冲区用于存储键缓存
         self.register_buffer("cache_k", None, persistent=False)
+        # 注册一个非持久性缓冲区用于存储值缓存
         self.register_buffer("cache_v", None, persistent=False)
+        # 环形缓冲区指针与有效长度
+        self.ptr_cur = 0
+        self.cache_len = 0
         ####################################################
 
     def forward(self, x, use_cache=False):
@@ -54,55 +64,92 @@ class MultiHeadAttention(nn.Module):
 
         ####################################################
         # NEW
+        # 如果使用缓存
         if use_cache:
+            # 初始化缓存（或当batch大小变化时重新初始化）
             if self.cache_k is None or self.cache_k.size(0) != b:
-                self.cache_k = torch.zeros(b, self.num_heads,
-                                           self.window_size, self.head_dim,
-                                           device=x.device)
-                self.cache_v = torch.zeros_like(self.cache_k)
-                self.ptr_cur = 0  # pointer to next free slot
+                self.cache_k = torch.empty(
+                    b, self.num_heads, self.window_size, self.head_dim,
+                    device=x.device, dtype=keys_new.dtype
+                )
+                self.cache_v = torch.empty_like(self.cache_k)
+                self.ptr_cur = 0
+                self.cache_len = 0
 
-            # if incoming chunk would overflow discard oldest tokens
-            if self.ptr_cur + num_tokens > self.window_size:
-                overflow = self.ptr_cur + num_tokens - self.window_size
-                # shift everything left by `overflow` (cheap view-copy)
-                self.cache_k[:, :, :-overflow, :] = self.cache_k[:, :, overflow:, :].clone()
-                self.cache_v[:, :, :-overflow, :] = self.cache_v[:, :, overflow:, :].clone()
-                self.ptr_cur -= overflow  # pointer after shift
+            # 仅保留当前块中最后 window_size 个token
+            tokens_to_write = min(num_tokens, self.window_size)
+            ksrc = keys_new[:, :, -tokens_to_write:, :]
+            vsrc = values_new[:, :, -tokens_to_write:, :]
 
-            self.cache_k[:, :, self.ptr_cur:self.ptr_cur + num_tokens, :] = keys_new
-            self.cache_v[:, :, self.ptr_cur:self.ptr_cur + num_tokens, :] = values_new
-            self.ptr_cur += num_tokens
+            # 分两段写入环形缓冲区，避免整体搬移
+            first_part = min(self.window_size - self.ptr_cur, tokens_to_write)
+            if first_part > 0:
+                self.cache_k[:, :, self.ptr_cur:self.ptr_cur + first_part, :] = ksrc[:, :, :first_part, :]
+                self.cache_v[:, :, self.ptr_cur:self.ptr_cur + first_part, :] = vsrc[:, :, :first_part, :]
+            second_part = tokens_to_write - first_part
+            if second_part > 0:
+                self.cache_k[:, :, 0:second_part, :] = ksrc[:, :, first_part:, :]
+                self.cache_v[:, :, 0:second_part, :] = vsrc[:, :, first_part:, :]
 
-            keys = self.cache_k[:, :, :self.ptr_cur, :]
-            values = self.cache_v[:, :, :self.ptr_cur, :]
+            # 更新指针与有效长度
+            self.ptr_cur = (self.ptr_cur + tokens_to_write) % self.window_size
+            self.cache_len = min(self.window_size, self.cache_len + tokens_to_write)
+
+            # 读取按时间顺序排列的键值（必要时拼接两段）
+            K_valid = self.cache_len
+            if K_valid == 0:
+                keys = self.cache_k[:, :, :0, :]
+                values = self.cache_v[:, :, :0, :]
+            else:
+                start = (self.ptr_cur - K_valid) % self.window_size
+                if start + K_valid <= self.window_size:
+                    keys = self.cache_k[:, :, start:start + K_valid, :]
+                    values = self.cache_v[:, :, start:start + K_valid, :]
+                else:
+                    part1 = self.window_size - start
+                    keys = torch.cat([
+                        self.cache_k[:, :, start:, :],
+                        self.cache_k[:, :, :K_valid - part1, :]
+                    ], dim=2)
+                    values = torch.cat([
+                        self.cache_v[:, :, start:, :],
+                        self.cache_v[:, :, :K_valid - part1, :]
+                    ], dim=2)
         else:
+            # 不使用缓存，直接使用新的键和值
             keys, values = keys_new, values_new
-            self.ptr_cur = 0  # keep pointer sane if you interleave modes
+            self.ptr_cur = 0  # 如果交错模式，保持指针正常
+            self.cache_len = 0
         ####################################################
         # Compute scaled dot-product attention (aka self-attention) with a causal mask
-        attn_scores = queries @ keys.transpose(2, 3)  # Dot product for each head
+        attn_scores = (queries * self.scale) @ keys.transpose(2, 3)  # 预缩放 queries
 
         ####################################################
         # NEW
         K = attn_scores.size(-1)
 
+        # 如果当前令牌数量等于K（即没有使用缓存或缓存已满）
         if num_tokens == K:
-            # No cache → use the pre‑baked triangular mask slice
-            causal_mask = torch.triu(torch.ones(num_tokens, K, device=x.device, dtype=torch.bool), diagonal=1)
+            causal_mask = torch.triu(
+                torch.ones((num_tokens, K), device=x.device, dtype=torch.bool),
+                diagonal=1,
+            )
         else:
-            # Cached: need to offset the diagonal by (K − num_tokens)
-            offset = K - num_tokens  # number of tokens already in cache before this chunk
-            row_idx = torch.arange(num_tokens, device=x.device).unsqueeze(1)  # (num_tokens, 1)
-            col_idx = torch.arange(K, device=x.device).unsqueeze(0)           # (1, K)
-            causal_mask = row_idx + offset < col_idx                          # True where j > i+offset
+            # 已缓存：通过 (K - num_tokens) 偏移对角线
+            offset = K - num_tokens
+            causal_mask = torch.triu(
+                torch.ones((num_tokens, K), device=x.device, dtype=torch.bool),
+                diagonal=1 + offset,
+            )
         ####################################################
 
         # Use the mask to fill attention scores
-        attn_scores.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), -torch.inf)
+        neg_inf = torch.finfo(attn_scores.dtype).min
+        attn_scores.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), neg_inf)
 
-        attn_weights = torch.softmax(attn_scores / keys.shape[-1]**0.5, dim=-1)
-        attn_weights = self.dropout(attn_weights)
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+        if self.training:
+            attn_weights = self.dropout(attn_weights)
 
         # Shape: (b, num_tokens, num_heads, head_dim)
         context_vec = (attn_weights @ values).transpose(1, 2)
@@ -117,35 +164,22 @@ class MultiHeadAttention(nn.Module):
     # NEW
     def reset_cache(self):
         self.cache_k, self.cache_v = None, None
+        self.ptr_cur = 0
+        self.cache_len = 0
     ####################################################
 
 
 #####################################
 # Chapter 4
 #####################################
-class LayerNorm(nn.Module):
+class LayerNorm(nn.LayerNorm):
     def __init__(self, emb_dim):
-        super().__init__()
-        self.eps = 1e-5
-        self.scale = nn.Parameter(torch.ones(emb_dim))
-        self.shift = nn.Parameter(torch.zeros(emb_dim))
-
-    def forward(self, x):
-        mean = x.mean(dim=-1, keepdim=True)
-        var = x.var(dim=-1, keepdim=True, unbiased=False)
-        norm_x = (x - mean) / torch.sqrt(var + self.eps)
-        return self.scale * norm_x + self.shift
+        super().__init__(normalized_shape=emb_dim, eps=1e-5)
 
 
-class GELU(nn.Module):
+class GELU(nn.GELU):
     def __init__(self):
-        super().__init__()
-
-    def forward(self, x):
-        return 0.5 * x * (1 + torch.tanh(
-            torch.sqrt(torch.tensor(2.0 / torch.pi)) *
-            (x + 0.044715 * torch.pow(x, 3))
-        ))
+        super().__init__(approximate='tanh')
 
 
 class FeedForward(nn.Module):
@@ -231,11 +265,16 @@ class GPTModel(nn.Module):
         ####################################################
         # NEW
 
+        # 如果使用缓存
         if use_cache:
+            # 计算位置ID，从当前指针位置开始
             pos_ids = torch.arange(self.ptr_current_pos, self.ptr_current_pos + seq_len, device=in_idx.device, dtype=torch.long)
+            # 更新当前指针位置
             self.ptr_current_pos += seq_len
         else:
+            # 不使用缓存，从0开始计算位置ID
             pos_ids = torch.arange(0, seq_len, device=in_idx.device, dtype=torch.long)
+        # 获取位置嵌入并增加一个维度
         pos_embeds = self.pos_emb(pos_ids).unsqueeze(0)
         ####################################################
 
@@ -245,6 +284,7 @@ class GPTModel(nn.Module):
         # x = self.trf_blocks(x)
         ####################################################
         # NEW
+        # 遍历所有Transformer块并应用
         for blk in self.trf_blocks:
             x = blk(x, use_cache=use_cache)
         ####################################################
@@ -255,34 +295,38 @@ class GPTModel(nn.Module):
 
     ####################################################
     # NEW
+    # 重置KV缓存
     def reset_kv_cache(self):
+        # 遍历所有Transformer块并重置其注意力模块的缓存
         for blk in self.trf_blocks:
             blk.att.reset_cache()
+        # 重置当前位置指针
         self.ptr_current_pos = 0
     ####################################################
 
 
+# 简单的文本生成函数
 def generate_text_simple(model, idx, max_new_tokens, context_size):
-    # idx is (B, T) array of indices in the current context
+    # idx 是当前上下文中的索引数组 (B, T)
     for _ in range(max_new_tokens):
 
-        # Crop current context if it exceeds the supported context size
-        # E.g., if LLM supports only 5 tokens, and the context size is 10
-        # then only the last 5 tokens are used as context
+        # 如果当前上下文超过支持的上下文大小，则裁剪
+        # 例如，如果LLM只支持5个令牌，上下文大小为10
+        # 那么只有最后5个令牌用作上下文
         idx_cond = idx[:, -context_size:]
 
-        # Get the predictions
-        with torch.no_grad():
+        # 获取预测
+        with torch.no_grad(): # 在不计算梯度的模式下运行
             logits = model(idx_cond)
 
-        # Focus only on the last time step
-        # (batch, n_token, vocab_size) becomes (batch, vocab_size)
+        # 只关注最后一个时间步
+        # (batch, n_token, vocab_size) 变为 (batch, vocab_size)
         logits = logits[:, -1, :]
 
-        # Get the idx of the vocab entry with the highest logits value
+        # 获取具有最高logit值的词汇表条目的索引
         idx_next = torch.argmax(logits, dim=-1, keepdim=True)  # (batch, 1)
 
-        # Append sampled index to the running sequence
+        # 将采样索引附加到正在运行的序列中
         idx = torch.cat((idx, idx_next), dim=1)  # (batch, n_tokens+1)
 
     return idx
@@ -290,52 +334,65 @@ def generate_text_simple(model, idx, max_new_tokens, context_size):
 
 ####################################################
 # NEW
+# 使用KV缓存生成文本的简化函数
 def generate_text_simple_cached(model, idx, max_new_tokens, context_size=None, use_cache=True):
-    model.eval()
+    model.eval() # 将模型设置为评估模式
 
+    # 获取上下文长度，如果未提供则使用模型的位置嵌入数量
     ctx_len = context_size or model.pos_emb.num_embeddings
 
-    with torch.no_grad():
-        if use_cache:
-            model.reset_kv_cache()
+    with torch.no_grad(): # 在不计算梯度的模式下运行
+        if use_cache: # 如果使用缓存
+            model.reset_kv_cache() # 重置KV缓存
+            # 对初始输入进行模型前向传播，并使用缓存
             logits = model(idx[:, -ctx_len:], use_cache=True)
 
-            for _ in range(max_new_tokens):
+            for _ in range(max_new_tokens): # 循环生成新的令牌
+                # 获取下一个令牌的索引（具有最高logit值的令牌）
                 next_idx = logits[:, -1].argmax(dim=-1, keepdim=True)
+                # 将新生成的令牌添加到序列中
                 idx = torch.cat([idx, next_idx], dim=1)
+                # 对新生成的令牌进行模型前向传播，并使用缓存
                 logits = model(next_idx, use_cache=True)
-        else:
-            for _ in range(max_new_tokens):
+        else: # 如果不使用缓存
+            for _ in range(max_new_tokens): # 循环生成新的令牌
+                # 对当前上下文进行模型前向传播，不使用缓存
                 logits = model(idx[:, -ctx_len:], use_cache=False)
+                # 获取下一个令牌的索引
                 next_idx = logits[:, -1].argmax(dim=-1, keepdim=True)
+                # 将新生成的令牌添加到序列中
                 idx = torch.cat([idx, next_idx], dim=1)
 
-    return idx
+    return idx # 返回生成的令牌序列
 ####################################################
 
 
+# 主函数
 def main():
+    # GPT模型配置
     GPT_CONFIG_124M = {
-        "vocab_size": 50257,     # Vocabulary size
-        "context_length": 1024,  # Context length
-        "emb_dim": 768,          # Embedding dimension
-        "n_heads": 12,           # Number of attention heads
-        "n_layers": 12,          # Number of layers
-        "drop_rate": 0.1,        # Dropout rate
-        "qkv_bias": False,       # Query-Key-Value bias
-        "kv_window_size": 1024   # NEW: KV cache window size
+        "vocab_size": 50257,     # 词汇表大小
+        "context_length": 1024,  # 上下文长度
+        "emb_dim": 768,          # 嵌入维度
+        "n_heads": 12,           # 注意力头数量
+        "n_layers": 12,          # 层数
+        "drop_rate": 0.1,        # Dropout 比率
+        "qkv_bias": False,       # Query-Key-Value 偏置
+        "kv_window_size": 1024   # 新增：KV 缓存窗口大小
     }
 
-    torch.manual_seed(123)
-    model = GPTModel(GPT_CONFIG_124M)
+    torch.manual_seed(123) # 设置随机种子以保证可复现性
+    model = GPTModel(GPT_CONFIG_124M) # 实例化GPT模型
+    # 根据CUDA可用性设置设备（GPU或CPU）
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    model.eval()  # disable dropout
+    model.to(device) # 将模型移动到指定设备
+    model.eval()  # 禁用dropout，将模型设置为评估模式
 
-    start_context = "Hello, I am"
+    start_context = "Hello, I am" # 初始文本上下文
 
-    tokenizer = tiktoken.get_encoding("gpt2")
-    encoded = tokenizer.encode(start_context)
+    tokenizer = tiktoken.get_encoding("gpt2") # 获取GPT2编码器
+    encoded = tokenizer.encode(start_context) # 编码初始文本
+    # 将编码后的文本转换为张量，并增加一个批次维度
     encoded_tensor = torch.tensor(encoded, device=device).unsqueeze(0)
 
     print(f"\n{50*'='}\n{22*' '}IN\n{50*'='}")
@@ -344,8 +401,8 @@ def main():
     print("encoded_tensor.shape:", encoded_tensor.shape)
 
     if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    start = time.time()
+        torch.cuda.synchronize() # 如果CUDA可用，同步CUDA操作
+    start = time.time() # 记录开始时间
 
     # token_ids = generate_text_simple(
     #     model=model,
@@ -356,6 +413,7 @@ def main():
 
     ####################################################
     # NEW
+    # 使用带缓存的文本生成函数
     token_ids = generate_text_simple_cached(
         model=model,
         idx=encoded_tensor,
@@ -364,9 +422,10 @@ def main():
     ####################################################
 
     if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    total_time = time.time() - start
+        torch.cuda.synchronize() # 如果CUDA可用，同步CUDA操作
+    total_time = time.time() - start # 计算总耗时
 
+    # 解码生成的令牌ID为文本
     decoded_text = tokenizer.decode(token_ids.squeeze(0).tolist())
 
     print(f"\n\n{50*'='}\n{22*' '}OUT\n{50*'='}")
@@ -377,10 +436,10 @@ def main():
     print(f"\nTime: {total_time:.2f} sec")
     print(f"{int(len(token_ids[0])/total_time)} tokens/sec")
     if torch.cuda.is_available():
-        max_mem_bytes = torch.cuda.max_memory_allocated()
-        max_mem_gb = max_mem_bytes / (1024 ** 3)
+        max_mem_bytes = torch.cuda.max_memory_allocated() # 获取最大内存分配
+        max_mem_gb = max_mem_bytes / (1024 ** 3) # 转换为GB
         print(f"Max memory allocated: {max_mem_gb:.2f} GB")
 
 
 if __name__ == "__main__":
-    main()
+    main() # 调用主函数

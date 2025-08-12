@@ -33,6 +33,7 @@ class MultiHeadAttention(nn.Module):
 
         ####################################################
         # NEW
+        # 注册缓冲区用于存储键（key）和值（value）的缓存，以及当前位置指针
         self.register_buffer("cache_k", None, persistent=False)
         self.register_buffer("cache_v", None, persistent=False)
         self.ptr_current_pos = 0
@@ -53,14 +54,19 @@ class MultiHeadAttention(nn.Module):
 
         ####################################################
         # NEW
+        # 如果使用缓存，则更新或初始化键值缓存
         if use_cache:
             if self.cache_k is None:
+                # 如果缓存为空，则将当前计算的键和值作为缓存
                 self.cache_k, self.cache_v = keys_new, values_new
             else:
-                self.cache_k = torch.cat([self.cache_k, keys_new], dim=1)
+                # 否则，将当前计算的键和值与现有缓存拼接
+                self.cache_k = torch.cat([self.cache_k, keys_new], dim=1)   #将新 Token 的 Key 向量追加到历史 Key 缓存的末尾
                 self.cache_v = torch.cat([self.cache_v, values_new], dim=1)
+            # 使用缓存的键和值
             keys, values = self.cache_k, self.cache_v
         else:
+            # 不使用缓存，直接使用当前计算的键和值
             keys, values = keys_new, values_new
         ####################################################
 
@@ -74,12 +80,15 @@ class MultiHeadAttention(nn.Module):
 
         ####################################################
         # NEW
+        # 获取查询和键的序列长度
         num_tokens_Q = queries.shape[-2]
         num_tokens_K = keys.shape[-2]
+        # 如果使用缓存，则根据当前位置指针截取掩码
         if use_cache:
             mask_bool = self.mask.bool()[
                 self.ptr_current_pos:self.ptr_current_pos + num_tokens_Q, :num_tokens_K
             ]
+            # 更新当前位置指针
             self.ptr_current_pos += num_tokens_Q
         ####################################################
         # Original mask truncated to the number of tokens and converted to boolean
@@ -103,10 +112,11 @@ class MultiHeadAttention(nn.Module):
 
     ####################################################
     # NEW
+    # 重置键值缓存和位置指针
     def reset_cache(self):
         self.cache_k, self.cache_v = None, None
         self.ptr_current_pos = 0
-    ####################################################
+        ####################################################
 
 
 #####################################
@@ -192,56 +202,74 @@ class TransformerBlock(nn.Module):
 class GPTModel(nn.Module):
     def __init__(self, cfg):
         super().__init__()
+        # 词嵌入层，将词汇表中的每个词映射到高维向量
         self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"])
+        # 位置嵌入层，为序列中的每个位置生成嵌入向量
         self.pos_emb = nn.Embedding(cfg["context_length"], cfg["emb_dim"])
+        # 嵌入层的Dropout，用于防止过拟合
         self.drop_emb = nn.Dropout(cfg["drop_rate"])
 
         # self.trf_blocks = nn.Sequential(
         #    *[TransformerBlock(cfg) for _ in range(cfg["n_layers"])])
         ####################################################
         # NEW
+        # Transformer块的列表，每个块包含多头注意力和前馈网络
         self.trf_blocks = nn.ModuleList(
             [TransformerBlock(cfg) for _ in range(cfg["n_layers"])])
 
+        # 当前位置指针，用于KV缓存中的位置嵌入
         self.current_pos = 0
         ####################################################
 
+        # 最终的Layer Normalization层
         self.final_norm = LayerNorm(cfg["emb_dim"])
+        # 输出层，将Transformer的输出映射回词汇表大小，用于生成下一个词的概率
         self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False)
 
     def forward(self, in_idx, use_cache=False):
+        # 获取输入序列的批大小和序列长度
         batch_size, seq_len = in_idx.shape
+        # 获取词嵌入
         tok_embeds = self.tok_emb(in_idx)
 
         # pos_embeds = self.pos_emb(torch.arange(seq_len, device=in_idx.device))
 
         ####################################################
         # NEW
-
+        # 如果使用缓存，则根据当前位置指针生成位置ID
         if use_cache:
             pos_ids = torch.arange(self.current_pos, self.current_pos + seq_len, device=in_idx.device, dtype=torch.long)
+            # 更新当前位置指针
             self.current_pos += seq_len
         else:
+            # 不使用缓存，从0开始生成位置ID
             pos_ids = torch.arange(0, seq_len, device=in_idx.device, dtype=torch.long)
+        # 获取位置嵌入并增加一个维度
         pos_embeds = self.pos_emb(pos_ids).unsqueeze(0)
         ####################################################
 
+        # 将词嵌入和位置嵌入相加
         x = tok_embeds + pos_embeds  # Shape [batch_size, num_tokens, emb_size]
+        # 应用嵌入层的Dropout
         x = self.drop_emb(x)
 
         # x = self.trf_blocks(x)
         ####################################################
         # NEW
+        # 遍历每个Transformer块并应用
         for blk in self.trf_blocks:
             x = blk(x, use_cache=use_cache)
         ####################################################
 
+        # 应用最终的Layer Normalization
         x = self.final_norm(x)
+        # 通过输出层获取logits
         logits = self.out_head(x)
         return logits
 
     ####################################################
     # NEW
+    # 重置KV缓存和当前位置指针
     def reset_kv_cache(self):
         for blk in self.trf_blocks:
             blk.att.reset_cache()
@@ -279,26 +307,34 @@ def generate_text_simple(model, idx, max_new_tokens, context_size):
 # NEW
 def generate_text_simple_cached(model, idx, max_new_tokens,
                                 context_size=None, use_cache=True):
+    # 将模型设置为评估模式（禁用dropout等）
     model.eval()
+    # 获取上下文长度，如果未提供则使用模型的位置嵌入长度
     ctx_len = context_size or model.pos_emb.num_embeddings
 
     with torch.no_grad():
         if use_cache:
-            # Init cache with full prompt
+            # 如果使用缓存：
+            # 初始化KV缓存，清除之前的缓存状态
             model.reset_kv_cache()
+            # 使用完整提示初始化缓存，并获取初始logits
             logits = model(idx[:, -ctx_len:], use_cache=True)
 
             for _ in range(max_new_tokens):
-                # a) pick the token with the highest log-probability (greedy sampling)
+                # a) 贪婪采样：选择具有最高对数概率的下一个token
                 next_idx = logits[:, -1].argmax(dim=-1, keepdim=True)
-                # b) append it to the running sequence
+                # b) 将新生成的token追加到序列中
                 idx = torch.cat([idx, next_idx], dim=1)
-                # c) feed model only the new token
+                # c) 仅将新生成的token输入模型，利用KV缓存进行高效推理
                 logits = model(next_idx, use_cache=True)
         else:
+            # 如果不使用缓存：
             for _ in range(max_new_tokens):
+                # 每次都将整个当前序列输入模型
                 logits = model(idx[:, -ctx_len:], use_cache=False)
+                # 贪婪采样：选择具有最高对数概率的下一个token
                 next_idx = logits[:, -1].argmax(dim=-1, keepdim=True)
+                # 将新生成的token追加到序列中
                 idx = torch.cat([idx, next_idx], dim=1)
 
     return idx
