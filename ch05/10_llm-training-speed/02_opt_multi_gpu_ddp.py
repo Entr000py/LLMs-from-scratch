@@ -14,56 +14,66 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import tiktoken
 
-# NEW imports (see Appendix A):
+# 新增导入（参见附录 A）:
 import platform
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 
-# NEW: function to initialize a distributed process group (1 process / GPU)
-# this allows communication among processes
-# (see Appendix A):
+# 新增：初始化分布式进程组（每个 GPU 一个进程，用于进程间通信；参见附录 A）
 def ddp_setup(rank, world_size):
     """
-    Arguments:
-        rank: a unique process ID
-        world_size: total number of processes in the group
+    参数:
+        rank: 该进程在分布式组内的唯一编号
+        world_size: 分布式进程总数
     """
-    # Only set MASTER_ADDR and MASTER_PORT if not already defined by torchrun
+    # 如果未由 torchrun 预先设置，则仅在此设置 MASTER_ADDR 与 MASTER_PORT
     if "MASTER_ADDR" not in os.environ:
         os.environ["MASTER_ADDR"] = "localhost"
     if "MASTER_PORT" not in os.environ:
         os.environ["MASTER_PORT"] = "12345"
 
-    # initialize process group
+    # 初始化进程组（进程间通信后端）
     if platform.system() == "Windows":
-        # Disable libuv because PyTorch for Windows isn't built with support
+        # 关闭 libuv；Windows 下的 PyTorch 未内置该支持
         os.environ["USE_LIBUV"] = "0"
-        # Windows users may have to use "gloo" instead of "nccl" as backend
-        # gloo: Facebook Collective Communication Library
+        # Windows 上通常需要使用 "gloo"（而非 "nccl"）作为后端
+        # gloo：Meta 开源的集体通信库
         init_process_group(backend="gloo", rank=rank, world_size=world_size)
     else:
-        # nccl: NVIDIA Collective Communication Library
+        # nccl：NVIDIA 集体通信库（Linux 多 GPU 的推荐后端）
         init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
+    # 将当前进程绑定到对应编号的 GPU，以确保 CUDA 操作路由到正确设备
     torch.cuda.set_device(rank)
 
 
 #####################################
-# Chapter 2
+# 第 2 章
 #####################################
 
 
 class GPTDatasetV1(Dataset):
+    """
+    以滑动窗口方式将长文本切分为重叠序列的数据集。
+    
+    参数:
+        txt: 原始长文本。
+        tokenizer: 分词/编码器（如 GPT-2 的 tiktoken 编码器）。
+        max_length: 每个样本的最大序列长度（输入 token 数）。
+        stride: 窗口步长；小于 max_length 时会产生重叠片段。
+    产出:
+        __getitem__ 返回 (input_ids, target_ids)，其中 target_ids 为 input_ids 右移一位的预测目标。
+    """
     def __init__(self, txt, tokenizer, max_length, stride):
         self.input_ids = []
         self.target_ids = []
 
-        # Tokenize the entire text
+        # 对整段文本进行分词/编码
         token_ids = tokenizer.encode(txt, allowed_special={"<|endoftext|>"})
 
-        # Use a sliding window to chunk the book into overlapping sequences of max_length
+        # 使用滑动窗口，将文本切分为长度为 max_length 的重叠序列
         for i in range(0, len(token_ids) - max_length, stride):
             input_chunk = token_ids[i:i + max_length]
             target_chunk = token_ids[i + 1: i + max_length + 1]
@@ -77,32 +87,46 @@ class GPTDatasetV1(Dataset):
         return self.input_ids[idx], self.target_ids[idx]
 
 
-# NEW: Modify to set shuffle=False and use a sampler
-# (See Appendix A):
+# 新增：设置 shuffle=False 并使用分布式采样器（参见附录 A）
 def create_dataloader_v1(txt, batch_size=4, max_length=256,
                          stride=128, drop_last=True, num_workers=0):
-    # Initialize the tokenizer
+    """
+    基于 `GPTDatasetV1` 构建 DataLoader，适配分布式训练的采样方式。
+
+    参数:
+        txt: 用于构建数据集的文本。
+        batch_size: 批大小。
+        max_length: 每个样本的最大序列长度。
+        stride: 滑动窗口步长。
+        drop_last: 是否丢弃最后一个不足批大小的 batch。
+        num_workers: DataLoader 预取线程数。
+
+    说明:
+        - shuffle 设为 False 是因为分布式场景下由 `DistributedSampler` 负责打乱与切分样本。
+        - `DistributedSampler` 会将样本均匀划分到各个进程/设备，避免重复。
+    """
+    # 初始化分词器
     tokenizer = tiktoken.get_encoding("gpt2")
 
-    # Create dataset
+    # 构建数据集
     dataset = GPTDatasetV1(txt, tokenizer, max_length, stride)
 
-    # Create dataloader
+    # 构建 DataLoader
     dataloader = DataLoader(
         dataset=dataset,
         batch_size=batch_size,
-        shuffle=False,  # NEW: False because of DistributedSampler below
+        shuffle=False,  # 由于使用 DistributedSampler，此处需设置为 False
         drop_last=drop_last,
         num_workers=num_workers,
         pin_memory=True,
-        # NEW: chunk batches across GPUs without overlapping samples:
-        sampler=DistributedSampler(dataset)  # NEW
+        # 使用分布式采样器，根据 rank/world_size 划分样本，确保各 GPU 样本不重叠
+        sampler=DistributedSampler(dataset)
     )
     return dataloader
 
 
 #####################################
-# Chapter 3
+# 第 3 章
 #####################################
 class PyTorchMultiHeadAttention(nn.Module):
     def __init__(self, d_in, d_out, num_heads, dropout=0.0, qkv_bias=False):
@@ -121,16 +145,16 @@ class PyTorchMultiHeadAttention(nn.Module):
     def forward(self, x):
         batch_size, num_tokens, embed_dim = x.shape
 
-        # (b, num_tokens, embed_dim) --> (b, num_tokens, 3 * embed_dim)
+        # (b, num_tokens, embed_dim) -> (b, num_tokens, 3 * embed_dim)
         qkv = self.qkv(x)
 
-        # (b, num_tokens, 3 * embed_dim) --> (b, num_tokens, 3, num_heads, head_dim)
+        # (b, num_tokens, 3 * embed_dim) -> (b, num_tokens, 3, num_heads, head_dim)
         qkv = qkv.view(batch_size, num_tokens, 3, self.num_heads, self.head_dim)
 
-        # (b, num_tokens, 3, num_heads, head_dim) --> (3, b, num_heads, num_tokens, head_dim)
+        # (b, num_tokens, 3, num_heads, head_dim) -> (3, b, num_heads, num_tokens, head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)
 
-        # (3, b, num_heads, num_tokens, head_dim) -> 3 times (b, num_heads, num_tokens, head_dim)
+        # 将 3 个张量分别视为 queries, keys, values，形状均为 (b, num_heads, num_tokens, head_dim)
         queries, keys, values = qkv
 
         use_dropout = 0. if not self.training else self.dropout
@@ -138,7 +162,7 @@ class PyTorchMultiHeadAttention(nn.Module):
         context_vec = nn.functional.scaled_dot_product_attention(
             queries, keys, values, attn_mask=None, dropout_p=use_dropout, is_causal=True)
 
-        # Combine heads, where self.d_out = self.num_heads * self.head_dim
+        # 合并多头，其中 self.d_out = self.num_heads * self.head_dim
         context_vec = context_vec.transpose(1, 2).contiguous().view(batch_size, num_tokens, self.d_out)
 
         context_vec = self.proj(context_vec)
@@ -147,7 +171,7 @@ class PyTorchMultiHeadAttention(nn.Module):
 
 
 #####################################
-# Chapter 4
+# 第 4 章
 #####################################
 
 
@@ -179,19 +203,19 @@ class TransformerBlock(nn.Module):
         self.drop_shortcut = nn.Dropout(cfg["drop_rate"])
 
     def forward(self, x):
-        # Shortcut connection for attention block
+        # 注意力模块的残差连接
         shortcut = x
         x = self.norm1(x)
-        x = self.att(x)   # Shape [batch_size, num_tokens, emb_size]
+        x = self.att(x)   # 张量形状为 [batch_size, num_tokens, emb_size]
         x = self.drop_shortcut(x)
-        x = x + shortcut  # Add the original input back
+        x = x + shortcut  # 与残差相加
 
-        # Shortcut connection for feed-forward block
+        # 前馈模块的残差连接
         shortcut = x
         x = self.norm2(x)
         x = self.ff(x)
         x = self.drop_shortcut(x)
-        x = x + shortcut  # Add the original input back
+        x = x + shortcut  # 与残差相加
 
         return x
 
@@ -213,7 +237,7 @@ class GPTModel(nn.Module):
         batch_size, seq_len = in_idx.shape
         tok_embeds = self.tok_emb(in_idx)
         pos_embeds = self.pos_emb(torch.arange(seq_len, device=in_idx.device))
-        x = tok_embeds + pos_embeds  # Shape [batch_size, num_tokens, emb_size]
+        x = tok_embeds + pos_embeds  # 张量形状为 [batch_size, num_tokens, emb_size]
         x = self.drop_emb(x)
         x = self.trf_blocks(x)
         x = self.final_norm(x)
@@ -222,43 +246,40 @@ class GPTModel(nn.Module):
 
 
 def generate_text_simple(model, idx, max_new_tokens, context_size):
-    # idx is (B, T) array of indices in the current context
+    # idx 的形状为 (B, T)，表示当前上下文的 token 索引
     for _ in range(max_new_tokens):
 
-        # Crop current context if it exceeds the supported context size
-        # E.g., if LLM supports only 5 tokens, and the context size is 10
-        # then only the last 5 tokens are used as context
+        # 若超出模型支持的上下文长度，则仅保留最后 context_size 个 token
         idx_cond = idx[:, -context_size:]
 
-        # Get the predictions
+        # 前向预测
         with torch.no_grad():
             logits = model(idx_cond)
 
-        # Focus only on the last time step
-        # (batch, n_token, vocab_size) becomes (batch, vocab_size)
+        # 仅取最后一个时间步；(batch, n_token, vocab_size) -> (batch, vocab_size)
         logits = logits[:, -1, :]
 
-        # Get the idx of the vocab entry with the highest logits value
-        idx_next = torch.argmax(logits, dim=-1, keepdim=True)  # (batch, 1)
+        # 取概率最高的下一个 token 索引
+        idx_next = torch.argmax(logits, dim=-1, keepdim=True)  # 形状为 (batch, 1)
 
-        # Append sampled index to the running sequence
-        idx = torch.cat((idx, idx_next), dim=1)  # (batch, n_tokens+1)
+        # 将新 token 追加到序列末尾
+        idx = torch.cat((idx, idx_next), dim=1)  # 形状变为 (batch, n_tokens+1)
 
     return idx
 
 #####################################
-# Chapter 5
+# 第 5 章
 #####################################
 
 
 def text_to_token_ids(text, tokenizer):
     encoded = tokenizer.encode(text)
-    encoded_tensor = torch.tensor(encoded).unsqueeze(0)  # add batch dimension
+    encoded_tensor = torch.tensor(encoded).unsqueeze(0)  # 增加 batch 维度
     return encoded_tensor
 
 
 def token_ids_to_text(token_ids, tokenizer):
-    flat = token_ids.squeeze(0)  # remove batch dimension
+    flat = token_ids.squeeze(0)  # 移除 batch 维度
     return tokenizer.decode(flat.tolist())
 
 
@@ -296,9 +317,16 @@ def evaluate_model(model, train_loader, val_loader, device, eval_iter):
 
 
 def generate_and_print_sample(model, device, start_context):
+    """
+    使用给定起始上下文在当前设备上生成一段示例文本，并只修改评估用到的状态。
+
+    说明:
+        - 若 `model` 被 DDP 包裹，则实际模块位于 `model.module` 中，需据此获取上下文长度。
+        - 生成结束后会恢复 `train()` 状态，尽量不干扰训练流程。
+    """
     model.eval()
 
-    # NEW: Modify for DDP
+    # 针对 DDP 的处理：若为 DDP 则从 model.module 读取位置嵌入长度
     context_size = model.module.pos_emb.weight.shape[0] if isinstance(model, DDP) else model.pos_emb.weight.shape[0]
     encoded = text_to_token_ids(start_context, tiktoken.get_encoding("gpt2")).to(device)
     with torch.no_grad():
@@ -307,35 +335,56 @@ def generate_and_print_sample(model, device, start_context):
             max_new_tokens=50, context_size=context_size
         )
         decoded_text = token_ids_to_text(token_ids, tiktoken.get_encoding("gpt2"))
-        print(decoded_text.replace("\n", " "))  # Compact print format
+        print(decoded_text.replace("\n", " "))  # 紧凑打印格式（去除换行）
     model.train()
 
 
 def train_model_simple_with_timing(model, train_loader, val_loader, optimizer, device,
                                    num_epochs, eval_freq, eval_iter, start_context):
+    """
+    训练主循环（含计时与分布式吞吐统计）。
+
+    参数:
+        model: 训练的模型（单卡或 DDP 包裹）。
+        train_loader: 训练数据加载器（分布式下应使用 DistributedSampler）。
+        val_loader: 验证数据加载器。
+        optimizer: 优化器（如 AdamW）。
+        device: 当前训练设备。
+        num_epochs: 训练轮数。
+        eval_freq: 每多少步触发一次评估与吞吐统计打印。
+        eval_iter: 每次评估时，从 dataloader 取多少个 batch 计算平均损失。
+        start_context: 用于周期性生成样例文本的起始提示。
+
+    返回:
+        train_losses, val_losses, track_tokens：训练/验证损失轨迹与累积 token 数轨迹。
+    """
     train_losses, val_losses, track_tokens = [], [], []
     total_tokens, global_step, last_tokens = 0, -1, 0
 
     # NEW: Determine the current rank (default to 0 if not distributed)
+    # 当前进程的 rank（未初始化分布式时默认为 0）
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     # world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
     # Variables for cumulative average tokens/sec
+    # 用于计算全局平均吞吐的累积量
     cumulative_tokens, cumulative_time = 0.0, 0.0
 
     # CUDA-specific timing setup
+    # CUDA 计时：通过 cuda Event 精确测量 GPU 端耗时；CPU 则使用 time.time
     use_cuda = device.type == "cuda"
     if use_cuda:
         t_start = torch.cuda.Event(enable_timing=True)
         t_end = torch.cuda.Event(enable_timing=True)
-        torch.cuda.synchronize()  # Ensure all prior CUDA operations are done
-        t_start.record()          # Start the timer for the first interval
+        torch.cuda.synchronize()  # 确保之前的 CUDA 操作已完成
+        t_start.record()          # 记录本区间起始时间
     else:
-        t0 = time.time()          # Start the timer for the first interval
+        t0 = time.time()          # 记录本区间起始时间（CPU）
 
     # Main training loop
     for epoch in range(num_epochs):
         # NEW: set epoch for DistributedSampler so each process gets a unique shuffle order
+        # 分布式场景需在每个 epoch 设置随机种子以保证各 rank 的采样顺序正确重排
         if isinstance(train_loader.sampler, DistributedSampler):
             train_loader.sampler.set_epoch(epoch)
 
@@ -349,6 +398,7 @@ def train_model_simple_with_timing(model, train_loader, val_loader, optimizer, d
             loss.backward()
             optimizer.step()
 
+            # 以 batch 的元素个数（近似 token 数）累计吞吐统计
             total_tokens += inp_batch.numel()
 
             # At evaluation intervals, measure elapsed time and tokens per second
@@ -356,27 +406,31 @@ def train_model_simple_with_timing(model, train_loader, val_loader, optimizer, d
                 # End timing for the current interval
                 if use_cuda:
                     t_end.record()
-                    torch.cuda.synchronize()  # Wait for all CUDA ops to complete.
-                    elapsed = t_start.elapsed_time(t_end) / 1000  # Convert ms to seconds
-                    t_start.record()  # Reset timer for the next interval
+                    torch.cuda.synchronize()  # 等待本区间所有 CUDA 操作完成
+                    elapsed = t_start.elapsed_time(t_end) / 1000  # ms 转秒
+                    t_start.record()  # 重置计时器，开始下一区间
                 else:
                     elapsed = time.time() - t0
-                    t0 = time.time()  # Reset timer for the next interval
+                    t0 = time.time()  # 重置计时器，开始下一区间
 
                 # Calculate local tokens processed during this interval
+                # 本区间内本进程处理的 token 数
                 local_interval = total_tokens - last_tokens
                 last_tokens = total_tokens
 
                 # Aggregate the tokens processed over all devices
+                # 通过 all_reduce 求和，得到全局（所有 GPU）在本区间处理的 token 数
                 local_tensor = torch.tensor([local_interval], device=device, dtype=torch.float)
                 global_tensor = local_tensor.clone()
                 torch.distributed.all_reduce(global_tensor, op=torch.distributed.ReduceOp.SUM)
                 global_interval = global_tensor.item()
 
                 # Global tokens per second for this interval
+                # 区间吞吐（全局）：token / s
                 global_tps = global_interval / elapsed if elapsed > 0 else 0
 
                 # Update cumulative tokens (local) and aggregate globally
+                # 维护累积量并再次 all_reduce 得到全局累积 token，随后计算全局平均吞吐
                 cumulative_tokens += local_interval
                 local_cum_tensor = torch.tensor([cumulative_tokens], device=device, dtype=torch.float)
                 global_cum_tensor = local_cum_tensor.clone()
@@ -386,12 +440,14 @@ def train_model_simple_with_timing(model, train_loader, val_loader, optimizer, d
                 global_avg_tps = global_cumulative_tokens / cumulative_time if cumulative_time > 0 else 0
 
                 # Evaluate model performance (this may add overhead)
+                # 评估当前模型在少量 batch 上的训练/验证损失（会带来额外开销）
                 train_loss, val_loss = evaluate_model(model, train_loader, val_loader, device, eval_iter)
                 train_losses.append(train_loss)
                 val_losses.append(val_loss)
                 track_tokens.append(total_tokens)
 
                 # NEW: Only print logs once per GPU (choosing the rank 0 GPU)
+                # 仅在 rank 0 打印，避免多卡重复输出
                 if rank == 0:
                     print(f"Ep {epoch+1}, Step {global_step:06d}, "
                           f"Train: {train_loss:.3f}, Val: {val_loss:.3f}, "
@@ -402,6 +458,7 @@ def train_model_simple_with_timing(model, train_loader, val_loader, optimizer, d
             generate_and_print_sample(model, device, start_context)
 
             # Memory stats
+            # 打印显存使用情况（仅在 CUDA 可用时）
             if torch.cuda.is_available():
                 current_device = torch.cuda.current_device()
                 allocated = torch.cuda.memory_allocated(current_device) / 1024**3  # Convert to GB
@@ -433,29 +490,28 @@ def plot_losses(epochs_seen, tokens_seen, train_losses, val_losses):
 
 
 #####################################
-# Main function calls
+# 主流程
 #####################################
 
-# NEW: Add rank and world_size
 def main(gpt_config, settings, rank, world_size):
 
-    ddp_setup(rank, world_size)  # NEW: initialize process groups
+    ddp_setup(rank, world_size)  # 初始化分布式进程组
     device = torch.device("cuda", rank)
 
     torch.manual_seed(123)
 
-    # NEW: Print info only on 1 GPU
+    # 仅在 rank 0 输出一次基础环境信息
     if rank == 0:
         print(f"PyTorch version: {torch.__version__}")
         if torch.cuda.is_available():
             print(f"CUDA version: {torch.version.cuda}")
 
             capability = torch.cuda.get_device_capability()
-            if capability[0] >= 7:  # Volta (7.0+), Turing (7.5+), Ampere (8.0+), Hopper (9.0+)
+            if capability[0] >= 7:  # Volta/Turing/Ampere/Hopper 及以上架构
                 torch.set_float32_matmul_precision("high")
-                print("Uses tensor cores")
+                print("使用 Tensor Cores")
             else:
-                print("Tensor cores not supported on this GPU. Using default precision.")
+                print("该 GPU 不支持 Tensor Cores，使用默认精度。")
         print()
 
     ##############################
@@ -465,7 +521,7 @@ def main(gpt_config, settings, rank, world_size):
     file_path = "middlemarch.txt"
     url = "https://www.gutenberg.org/cache/epub/145/pg145.txt"
 
-    # NEW: Only download 1 time
+    # 仅下载一次数据（由 rank 0 执行）
     if rank == 0:
         if not os.path.exists(file_path):
             with urllib.request.urlopen(url) as response:
@@ -473,7 +529,7 @@ def main(gpt_config, settings, rank, world_size):
             with open(file_path, "w", encoding="utf-8") as file:
                 file.write(text_data)
 
-    # NEW: All processes wait until rank 0 is done, using the GPU index.
+    # 所有进程等待 rank 0 完成下载（使用当前 GPU 索引同步）
     torch.distributed.barrier(device_ids=[device.index])
 
     with open(file_path, "r", encoding="utf-8") as file:
@@ -487,7 +543,7 @@ def main(gpt_config, settings, rank, world_size):
     model = torch.compile(model)
     model = model.to(device)
     model = model.to(torch.bfloat16)
-    # NEW: Wrap model with DDP
+    # 使用 DDP 包裹模型
     model = DDP(model, device_ids=[rank])
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=settings["learning_rate"], weight_decay=settings["weight_decay"],
@@ -498,7 +554,7 @@ def main(gpt_config, settings, rank, world_size):
     # Set up dataloaders
     ##############################
 
-    # Train/validation ratio
+    # 训练/验证集划分比例
     train_ratio = 0.90
     split_idx = int(train_ratio * len(text_data))
 
@@ -521,7 +577,7 @@ def main(gpt_config, settings, rank, world_size):
     )
 
     ##############################
-    # Train model
+    # 开始训练
     ##############################
 
     train_losses, val_losses, tokens_seen = train_model_simple_with_timing(
@@ -536,7 +592,7 @@ def main(gpt_config, settings, rank, world_size):
         start_context="Every effort moves you",
     )
 
-    # NEW: Clean up distributed processes
+    # 训练结束，清理分布式进程组
     destroy_process_group()
 
     return train_losses, val_losses, tokens_seen, model
@@ -544,7 +600,7 @@ def main(gpt_config, settings, rank, world_size):
 
 if __name__ == "__main__":
 
-    # NEW: Extract rank and world size from environment variables
+    # 从环境变量中读取 world_size 与 rank
     if "WORLD_SIZE" in os.environ:
         world_size = int(os.environ["WORLD_SIZE"])
     else:
@@ -558,17 +614,17 @@ if __name__ == "__main__":
         rank = 0
 
     GPT_CONFIG_124M = {
-        "vocab_size": 50304,     # Vocabulary size
-        "context_length": 1024,  # Input tokens per training example
-        "emb_dim": 768,          # Embedding dimension
-        "n_heads": 12,           # Number of attention heads
-        "n_layers": 12,          # Number of layers
-        "drop_rate": 0.1,        # Dropout rate
-        "qkv_bias": False        # Query-key-value bias
+        "vocab_size": 50304,     # 词表大小
+        "context_length": 1024,  # 每个训练样本的输入 token 数
+        "emb_dim": 768,          # 词向量/隐藏维度
+        "n_heads": 12,           # 注意力头数
+        "n_layers": 12,          # 层数
+        "drop_rate": 0.1,        # Dropout 比例
+        "qkv_bias": False        # Q/K/V 线性层是否使用偏置
     }
 
     OTHER_SETTINGS = {
-        "learning_rate": 5e-4,  # * world_size,  # NEW: Increase learning rate to account for multiple GPUs
+        "learning_rate": 5e-4,  # 可按 world_size 线性放大（多卡时）
         "num_epochs": 50,
         "batch_size": 32,
         "weight_decay": 0.1
@@ -584,17 +640,17 @@ if __name__ == "__main__":
     )
 
     ###########################
-    # After training
+    # 训练后处理
     ###########################
 
-    # NEW: Only create 1 plot
+    # 仅由 rank 0 生成一次图表
     if rank == 0:
-        # Plot results
+        # 绘制损失曲线
         epochs_tensor = torch.linspace(0, OTHER_SETTINGS["num_epochs"], len(train_losses))
         plot_losses(epochs_tensor, tokens_seen, train_losses, val_losses)
         plt.savefig("loss.pdf")
 
-    # Save and load model
+    # 模型保存/加载（示例，默认注释）
     #
     # compiled = hasattr(model, "_orig_mod")
     # if compiled:

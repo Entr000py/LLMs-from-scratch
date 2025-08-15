@@ -113,7 +113,7 @@ def train_model(model, train_loader, val_loader, optimizer, device,
 if __name__ == "__main__":
 
     # Generate all combinations of hyperparameters
-    hyperparameter_combinations = list(itertools.product(*HPARAM_GRID.values()))
+    hyperparameter_combinations = list(itertools.product(*HPARAM_GRID.values()))    #可迭代对象
     total_combinations = len(hyperparameter_combinations)
     print(f"Total hyperparameter configurations: {total_combinations}")
 
