@@ -41,35 +41,30 @@ def preprocess_text(text):
 def find_near_duplicates(json_data, threshold=0.75, key="instruction"):
     """The higher the threshold, the more similar the texts have to be to match"""
 
-    # Extract instructions
-    text = [preprocess_text(item[key]) for item in json_data if item[key]]
-    near_duplicates = []
-    indices_to_remove = set()
-
+    # 预过滤长度小于等于1的文本，避免后续多次判断
+    valid_indices = [i for i, item in enumerate(json_data) if item.get(key) and len(item[key]) > 1]
+    text = [preprocess_text(json_data[i][key]) for i in valid_indices]
     if not text:
-        return {}, near_duplicates
+        return {}, []
 
-    # Vectorize the text data
+    import numpy as np
     vectorizer = TfidfVectorizer(stop_words=None, analyzer='char', ngram_range=(1, 3))
     tfidf_matrix = vectorizer.fit_transform(text)
-
-    # Compute cosine similarity between each pair of entries
     cos_sim_matrix = cosine_similarity(tfidf_matrix)
 
-    # Find pairs of near-duplicate instructions based on the threshold
-
-    for i in range(len(cos_sim_matrix)):
-        for j in range(i+1, len(cos_sim_matrix)):
+    near_duplicates = []
+    indices_to_remove = set()
+    n = len(valid_indices)
+    # 只遍历有效索引，避免无效文本
+    for i in range(n):
+        for j in range(i+1, n):
             if cos_sim_matrix[i, j] > threshold:
-                if len(json_data[i][key]) <= 1 or len(json_data[j][key]) <= 1:
-                    continue
-                near_duplicates.append((json_data[i], json_data[j], cos_sim_matrix[i, j]))
-                if key in ("input", "output"):  # Don't remove duplicates based on the instruction
-                    indices_to_remove.add(j)  # Mark the second entry for removal
+                idx_i, idx_j = valid_indices[i], valid_indices[j]
+                near_duplicates.append((json_data[idx_i], json_data[idx_j], cos_sim_matrix[i, j]))
+                if key in ("input", "output"):
+                    indices_to_remove.add(idx_j)
 
-    # Remove the near-duplicate entries
-    filtered_json_data = [item for index, item in enumerate(json_data) if index not in indices_to_remove]
-
+    filtered_json_data = [item for idx, item in enumerate(json_data) if idx not in indices_to_remove]
     return filtered_json_data, near_duplicates
 
 
